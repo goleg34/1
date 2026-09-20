@@ -1,0 +1,96 @@
+name: vpn
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'      # каждый запуск = новая нода, новая UUID, новый CF-хост
+
+jobs:
+  vpn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # ~5ч55м, безопасно до хардкапа в 6ч
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build xray + cloudflared + emit vless
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          WSPATH="/$(openssl rand -hex 8)"
+          PORT=8080
+
+          # ---------- Xray ----------
+          mkdir -p /tmp/xray && cd /tmp/xray
+          curl -fsSL -o xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip && chmod +x xray
+
+          cat > config.json <<EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": ${PORT},
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "${UUID}"}],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "ws",
+                "wsSettings": {"path": "${WSPATH}"}
+              }
+            }],
+            "outbounds": [
+              {"protocol": "freedom",   "tag": "direct"},
+              {"protocol": "blackhole", "tag": "block"}
+            ]
+          }
+          EOF
+
+          nohup ./xray -c config.json >/tmp/xray/xray.log 2>&1 &
+          sleep 3
+
+          # ---------- Cloudflare quick tunnel ----------
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+
+          nohup /tmp/cloudflared tunnel --no-autoupdate \
+            --url "http://127.0.0.1:${PORT}" \
+            >/tmp/cloudflared.log 2>&1 &
+          sleep 15
+
+          CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log \
+                   | head -1 | sed 's#https://##')
+          if [ -z "${CFHOST:-}" ]; then
+            echo "!! cloudflared не выдал хост, лог:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          # ---------- vless-ссылка для Happ ----------
+          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=ws&host=${CFHOST}&path=${WSPATH}#gh-${GITHUB_RUN_ID}"
+
+          echo
+          echo "======================================================"
+          echo "  HAPP — скопируй строку ниже, вставь из буфера"
+          echo "======================================================"
+          echo "${VLESS}"
+          echo "======================================================"
+          echo "  хост:     ${CFHOST}"
+          echo "  ws path:  ${WSPATH}"
+          echo "  UUID:     ${UUID}"
+          echo "  истекает: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
+          echo "  (при schedule следующий запуск через ~6ч даст новый конфиг)"
+          echo "======================================================"
+          echo
+
+          # ---------- keep-alive: не даём шагу завершиться ----------
+          while true; do
+            sleep 300
+            pgrep -f '/tmp/xray/xray'          >/dev/null || exit 1
+            pgrep -f '/tmp/cloudflared tunnel' >/dev/null || exit 1
+          done
