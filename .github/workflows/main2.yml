@@ -1,0 +1,91 @@
+name: vpn
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  vpn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: vpn
+        shell: bash
+        run: |
+          set +e
+
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          WSPATH="/$(openssl rand -hex 8)"
+          PORT=8080
+
+          mkdir -p /tmp/xray && cd /tmp/xray
+          curl -fsSL -o xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip && chmod +x xray
+
+          cat > config.json <<EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{
+              "listen": "127.0.0.1",
+              "port": ${PORT},
+              "protocol": "vless",
+              "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": "${WSPATH}"}}
+            }],
+            "outbounds": [{"protocol": "freedom"}]
+          }
+          EOF
+
+          nohup ./xray -c config.json >/tmp/xray/xray.log 2>&1 &
+          sleep 3
+
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+
+          nohup /tmp/cloudflared tunnel --no-autoupdate \
+            --url "http://127.0.0.1:${PORT}" >/tmp/cloudflared.log 2>&1 &
+          sleep 20
+
+          CFHOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 | sed 's#https://##')
+          if [ -z "${CFHOST:-}" ]; then
+            echo "!! cloudflared не стартанул:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          VLESS="vless://${UUID}@${CFHOST}:443?encryption=none&security=tls&sni=${CFHOST}&type=ws&host=${CFHOST}&path=${WSPATH}#gh-${GITHUB_RUN_ID}"
+
+          echo
+          echo "================================================================"
+          echo "  HAPP — скопируй строку ниже"
+          echo "================================================================"
+          echo "${VLESS}"
+          echo "================================================================"
+          echo "  host:   ${CFHOST}"
+          echo "  path:   ${WSPATH}"
+          echo "  uuid:   ${UUID}"
+          echo "  expire: $(date -u -d '+355 minutes' '+%Y-%m-%d %H:%M UTC')"
+          echo "================================================================"
+          echo
+
+          START=$(date +%s)
+          END=$((START + 355*60))
+          N=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 600
+            N=$((N+1))
+            X=$(pgrep -f '/tmp/xray/xray' | head -1)
+            C=$(pgrep -f '/tmp/cloudflared' | head -1)
+            if [ -z "${X:-}" ] || [ -z "${C:-}" ]; then
+              echo "!! процесс упал: xray=${X:-none} cf=${C:-none}"
+              cat /tmp/xray/xray.log | tail -20
+              cat /tmp/cloudflared.log | tail -20
+              exit 1
+            fi
+            ELAPSED=$(( $(date +%s) - START ))
+            printf '[heartbeat %02d] up=%dm  xray=%s cf=%s  %s\n' \
+              "$N" "$((ELAPSED/60))" "$X" "$C" "$(date -u '+%H:%M:%S')"
+          done
